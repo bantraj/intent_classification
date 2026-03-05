@@ -12,10 +12,19 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_classic.schema import Document
 from langchain_community.retrievers import BM25Retriever
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings,ChatOpenAI
 import time
+from pydantic import BaseModel
+from typing import List
+from langchain_core.prompts import ChatPromptTemplate
+
+class QueryExpansion(BaseModel):
+    intent: str
+    rephrased_queries: List[str]
 
 load_dotenv()
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -137,14 +146,46 @@ async def search_intent(collection_name: str, query: str, mode: SearchType):
         len(results or []),
         elapsed_ms,
     )
+    top_result = results[0]
+    matched_intent = top_result.metadata.get("intent")
+    matched_utterance = top_result.metadata.get("original_utterance")
 
-    if not results:
-        return {"message": "No match found", "latency_ms": elapsed_ms}
+    structured_llm = llm.with_structured_output(QueryExpansion)
+
+    try:
+        # Force structured output using Pydantic
+        structured_llm = llm.with_structured_output(schema=QueryExpansion,include_raw=False)
+
+        prompt_template = ChatPromptTemplate.from_template("""
+            You are an AI language expert. A user provided a query that matched a specific intent.
+
+            USER QUERY: {query}
+            MATCHED INTENT: {intent}
+            DATABASE UTTERANCE: {context}
+
+            Task:
+            1. Confirm the intent.
+            2. Provide a list of 4 diverse, natural ways a user could rephrase this request.
+            """)
+
+        chain = prompt_template | structured_llm
+
+        expansion = chain.invoke({
+            "query": query,
+            "intent": matched_intent,
+            "context": matched_utterance
+        })
+    except Exception as e:
+        logger.error("LLM expansion failed: %s", e)
+        # Fallback if LLM fails
+        expansion = QueryExpansion(intent=matched_intent, rephrased_queries=[])
 
     return {
         "search_mode": mode,
-        "matched_utterance": results[0].page_content,
-        "detected_intent": results[0].metadata.get("intent")
+        "latency_ms": elapsed_ms,
+        "detected_intent": expansion.intent,
+        "matched_utterance": matched_utterance,
+        "rephrased_queries": expansion.rephrased_queries
     }
 
 #
